@@ -4,6 +4,7 @@
 #include "SPIFFS.h"
 #include <nvs_flash.h>
 #include "WiFi.h"
+#include <Arduino.h>
 
 #define ESCPIN 5
 #define SENSOR 4
@@ -15,7 +16,7 @@ double error = 0;                               // erro atual em relação ao se
 double angulo = 0, anguloAD = 0, lastErro = 0;  // ângulo atual e o último medido
 double kp, ki, kd;                              // constantes do controlador PID
 double P = 0, I = 0, D = 0, PID = 0;            // variáveis auxiliares do PID
-double controlePWM = 0;                         // valor do PWM enviado ao motor
+double controle = 0;                            // valor de controle
 String data;                                    // Dados que serão enviado à pagina
 bool start = false;                             // Flag que indica inicialização do processo
 long lastProcess = 0;                           // Armazena o tempo do último processo
@@ -23,6 +24,9 @@ long tempo = 0;                                 // Armazena o tempo para a vári
 int now = 0;                                    // Armazena o tempo atual do sistema
 float deltaTime = 0;                            // Armazena a variação do tempo 
 int calibracao[2];                              // Armazena os valores de calibração
+int loopTime;                                   // Tempo de amostragem
+uint16_t contador = 0;
+double somatorio = 0;
 
 // Criação da variavel de controle do ESC (PWM)
 Servo esc;
@@ -118,6 +122,16 @@ void leAngulo()
   angulo = map(anguloAD, calibracao[0], calibracao[1], 0, 90);
 }
 
+void controleMotor(float tensao){  
+  
+  uint16_t controle = (uint16_t) (1000.0f + (tensao / 12.0f) * (2000.0f - 1000.0f));
+
+  if (controle < 1000) controle = 1000;
+  if (controle > 2000) controle = 2000;
+
+  esc.writeMicroseconds(controle);
+}
+
 // Task que envia os dados ao servidor
 void taskAtualiza(void *parameter)
 {
@@ -136,7 +150,6 @@ void setup()
   Serial.begin(115200);
 
   analogReadResolution(12);      // Define resolução para 12 bits
-  adcAttachPin(SENSOR);          // Define o pino ADC
   analogSetAttenuation(ADC_6db); // Define atenuação para 11dB (0-3.9V)
 
   // Inicialização do sistemas de arquivos
@@ -148,8 +161,8 @@ void setup()
 
   // Configuração do controle PWM
   esc.attach(ESCPIN);
-  esc.writeMicroseconds(1000);
-
+  controleMotor(0);
+  
   // Inicio da conexão WiFi
   WiFi.softAP("ESP32", NULL);
 
@@ -187,7 +200,7 @@ void setup()
             {
 
     setpoint = request->getParam(0)->value().toFloat();
-    setpoint = map(setpoint, 0, 90, calibracao[0], calibracao[1]);
+    //setpoint = map(setpoint, 0, 90, calibracao[0], calibracao[1]);
 
     kp = request->getParam(1)->value().toFloat();
     ki = request->getParam(2)->value().toFloat();
@@ -201,6 +214,10 @@ void setup()
     P = I = D = PID = 0;
     request->send(200, "text/plain", "Iniciado");
     start = true;
+    angulo = 0;
+    lastProcess = 0;
+    contador = 0;
+    somatorio = 0;
     tempo = millis(); });
 
   // Rota para parar o monitoramento
@@ -238,14 +255,15 @@ void loop()
   //Flag que indica que o sistem tem que iniciar
   while (start)
   {
-    leAngulo();
-
     //Verifica se é o primeiro processo
     if (lastProcess == 0)
     {
-      PID = 0;
-      lastErro = 0;
+      leAngulo();
+      PID = I = D = P = 0;
+      lastErro = setpoint;
       lastProcess = millis();
+      now = millis();
+      delay(1);
     }
     else
     {
@@ -254,14 +272,20 @@ void loop()
       deltaTime = (now - lastProcess) / 1000.0;
       lastProcess = now;
 
+      if (contador > 0)
+        angulo =(float)(somatorio / contador);
+        
+      contador = 0;
+      somatorio = 0;
+
       //Calculo do erro
-      error = (setpoint - anguloAD);
+      error = setpoint - angulo;
 
       // Proporcional
       P = error * kp;
 
       // Integral
-      I = I + (error * ki) * deltaTime;
+      I += (error * ki) * deltaTime;
 
       // Derivativo
       D = ((error - lastErro) * kd) / deltaTime;
@@ -272,20 +296,21 @@ void loop()
       //Recebe a última leitura
       lastErro = error;
     }
-
-    controlePWM = PID + minPwm;
-
-    //Segurança para o controle PWM
-    if (controlePWM < 1000)
-      controlePWM = 1000;
-    else if (controlePWM > 1216)
-      controlePWM = 1216;
-
-    // Envia o valor do PWM ao motor
-    esc.writeMicroseconds(controlePWM);
+    
+    if (PID < 0) PID = 0;
+    if (PID > 12) PID = 12;
+    controleMotor(PID);
 
     data = "[" + String(millis() - tempo) + ", " + String(angulo) + "]";
 
-    delay(50);
+    loopTime = millis() - now;
+
+    while(loopTime < 50){
+      leAngulo();
+      somatorio += angulo;
+      contador++;
+      delay(1);
+      loopTime = millis() - now;
+    }  
   }
 }
